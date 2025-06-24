@@ -277,82 +277,49 @@ func sortChildrenByBirth(n *TNode) {
 	}
 }
 
-// Reingold-Tilford tidy tree (simplified)
-func firstWalk(n *TNode, depth int) {
+// ---------------------------------------------------------------------------
+// Simple tidy-ish layout: depth-first, in-order traversal assigns successive X
+// positions to leaf nodes ensuring every node within the same generation gets
+// its own column. Interior nodes are centred above their children. This avoids
+// overlapping without the complexity of a full Reingold-Tilford algorithm.
+// ---------------------------------------------------------------------------
+
+func layout(root *TNode) {
+	var nextX float64
+	assignX(root, &nextX)
+
+	// normalise so that minimum X is zero (cosmetic)
+	min := findMinX(root, 0)
+	if min < 0 {
+		shift(root, -min)
+	}
+
+	// populate Y using generation (1-based) so that vertical spacing is
+	// consistent between ancestor and descendant layouts.
+	setY(root)
+}
+
+// assignX recursively assigns horizontal positions.
+func assignX(n *TNode, next *float64) {
 	if len(n.Children) == 0 {
-		if sib := leftSibling(n); sib != nil {
-			n.X = sib.X + 1
-		} else {
-			n.X = 0
-		}
+		n.X = *next
+		*next += 1
 		return
 	}
 	for _, c := range n.Children {
-		firstWalk(c, depth+1)
+		assignX(c, next)
 	}
-	mid := (n.Children[0].X + n.Children[len(n.Children)-1].X) / 2
-	if sib := leftSibling(n); sib != nil {
-		n.X = sib.X + 1
-		n.Mod = n.X - mid
-	} else {
-		n.X = mid
-	}
+	n.X = (n.Children[0].X + n.Children[len(n.Children)-1].X) / 2
 }
 
-func secondWalk(n *TNode, mod, depth float64, min *float64) {
-	n.X += mod
-	n.Y = depth
-	if n.X < *min {
-		*min = n.X
+func findMinX(n *TNode, currentMin float64) float64 {
+	if n.X < currentMin {
+		currentMin = n.X
 	}
 	for _, c := range n.Children {
-		secondWalk(c, mod+n.Mod, depth+1, min)
+		currentMin = findMinX(c, currentMin)
 	}
-}
-
-// DFS search: return the parent of the node whose Key == target.
-// If the target is the root, returns nil.
-func findParent(curr *TNode, target string) *TNode {
-	if curr == nil {
-		return nil
-	}
-	for _, ch := range curr.Children {
-		if ch.Key == target {
-			return curr
-		}
-		if p := findParent(ch, target); p != nil {
-			return p
-		}
-	}
-	return nil
-}
-
-func leftSibling(n *TNode) *TNode {
-	if n == nil || n.Generation == 1 {
-		return nil
-	}
-	parent := findParent(rootRef, n.Key)
-	if parent == nil {
-		return nil
-	}
-	for i, c := range parent.Children {
-		if c == n && i > 0 {
-			return parent.Children[i-1]
-		}
-	}
-	return nil
-}
-
-var rootRef *TNode // used by leftSibling()
-
-func layout(root *TNode) {
-	rootRef = root
-	firstWalk(root, 0)
-	minX := 0.0
-	secondWalk(root, 0, 0, &minX)
-	if minX < 0 {
-		shift(root, -minX)
-	}
+	return currentMin
 }
 
 func shift(n *TNode, dx float64) {
@@ -367,6 +334,13 @@ func collect(nodes *[]*TNode, n *TNode) {
 	*nodes = append(*nodes, n)
 	for _, c := range n.Children {
 		collect(nodes, c)
+	}
+}
+
+func setY(n *TNode) {
+	n.Y = float64(n.Generation - 1)
+	for _, c := range n.Children {
+		setY(c)
 	}
 }
 
@@ -390,6 +364,12 @@ func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 	var cvs canvas.Canvas
 	var nodes []*TNode
 	collect(&nodes, tree)
+
+	// build quick lookup for node positions (by key)
+	nodeByKey := make(map[string]*TNode, len(nodes))
+	for _, tn := range nodes {
+		nodeByKey[tn.Key] = tn
+	}
 
 	for _, n := range nodes {
 		id := n.Key
@@ -416,14 +396,23 @@ func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 			Text:   &text,
 		})
 		if n.SpouseKey != "" {
-			spID := n.SpouseKey
+			spID := normalizePtr(n.SpouseKey)
 			label := "spouse"
+
+			// Decide edge sides based on horizontal positions.
+			fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+			if spNode, ok := nodeByKey[spID]; ok {
+				if n.X > spNode.X { // n is to the right of spouse
+					fromSide, toSide = "left", "right"
+				}
+			}
+
 			cvs.Edges = append(cvs.Edges, &canvas.Edge{
 				ID:       id + "_" + spID,
 				FromNode: id,
 				ToNode:   spID,
-				FromSide: strptr("right"),
-				ToSide:   strptr("left"),
+				FromSide: strptr(fromSide),
+				ToSide:   strptr(toSide),
 				Label:    &label,
 			})
 		}
@@ -456,6 +445,13 @@ func BuildCanvasAnc(doc *ged.Document, root string) *canvas.Canvas {
 	}
 
 	var cvs canvas.Canvas
+
+	// build quick lookup for node positions (by key)
+	nodeByKey := make(map[string]*TNode, len(nodes))
+	for _, tn := range nodes {
+		nodeByKey[tn.Key] = tn
+	}
+
 	for _, n := range nodes {
 		id := n.Key
 		yPix := int((maxGen - n.Y) * yScale) // flip
@@ -485,11 +481,22 @@ func BuildCanvasAnc(doc *ged.Document, root string) *canvas.Canvas {
 
 		// spouse edge (if spouse actually present in tree)
 		if n.SpouseKey != "" {
+			spID := normalizePtr(n.SpouseKey)
+
+			// Decide edge sides based on horizontal positions.
+			fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+			if spNode, ok := nodeByKey[spID]; ok {
+				if n.X > spNode.X { // n is to the right of spouse
+					fromSide, toSide = "left", "right"
+				}
+			}
+
 			cvs.Edges = append(cvs.Edges, &canvas.Edge{
-				ID:       id + "_" + n.SpouseKey,
-				FromNode: id, ToNode: n.SpouseKey,
-				FromSide: strptr("right"), ToSide: strptr("left"),
-				Label: strptr("spouse"),
+				ID:       id + "_" + spID,
+				FromNode: id,
+				ToNode:   spID,
+				FromSide: strptr(fromSide),
+				ToSide:   strptr(toSide),
 			})
 		}
 		// parent → child edges  (note: n.Children are *parents*)
