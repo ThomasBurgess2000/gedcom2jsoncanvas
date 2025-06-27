@@ -157,7 +157,7 @@ func buildDescTree(m *Model, root string) *TNode {
 		ind := m.Indi[cur.Key]
 		if ind == nil || len(ind.SpouseFams) == 0 {
 			if debug {
-				log.Printf("no spouse families for %s", cur.Key)
+				log.Printf("no spouse families for %s", ind.Name)
 			}
 			continue
 		}
@@ -181,7 +181,33 @@ func buildDescTree(m *Model, root string) *TNode {
 		log.Printf("spouse of: %s is %s, adding", cur.Name, m.Indi[cur.SpouseKey].Name)
 		cur.SpouseKey = m.Indi[cur.SpouseKey].ID
 
+		// Check if spouse has siblings, and add them to the stack
+		if cur.SpouseKey != "" {
+			spouse := m.Indi[cur.SpouseKey]
+			if spouse.ChildFam != "" {
+
+				spouseFam := m.Fam[spouse.ChildFam]
+
+				for _, child := range spouseFam.Children {
+					childInd := m.Indi[normalizePtr(child)]
+					if childInd == nil {
+						log.Printf("warning: child %q referenced in family %q not found", child, spouse.ChildFam)
+						continue
+					}
+					if childInd.ID != cur.SpouseKey {
+						stack = append(stack, &TNode{
+							Key:        childInd.ID,
+							Name:       childInd.Name,
+							Birth:      childInd.Birth,
+							Generation: cur.Generation,
+						})
+					}
+				}
+			}
+		}
+
 		// children
+		log.Printf("Checking children of: %s", cur.Name)
 		for _, c := range fam.Children {
 			chInd := m.Indi[normalizePtr(c)]
 			if chInd == nil {
@@ -189,7 +215,7 @@ func buildDescTree(m *Model, root string) *TNode {
 				continue
 			}
 			if debug {
-				log.Printf("adding child %s to %s", c, cur.Key)
+				log.Printf("adding child %s to %s", chInd.Name, cur.Name)
 			}
 			child := &TNode{
 				Key:        c,
@@ -393,6 +419,40 @@ func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 				FromSide: strptr("left"),
 				ToSide:   strptr("right"),
 			})
+
+			// Check if the spouse has siblings, and add them to the canvas
+			if model.Indi[n.SpouseKey].ChildFam != "" {
+				spouseFam := model.Fam[model.Indi[n.SpouseKey].ChildFam]
+				for _, child := range spouseFam.Children {
+					childInd := model.Indi[normalizePtr(child)]
+					if childInd.ID != n.SpouseKey {
+						cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+							ID:     childInd.ID,
+							Type:   "text",
+							X:      int(n.X * xScale),
+							Y:      int(n.Y * yScale),
+							Width:  nodeW,
+							Height: nodeH,
+							Text:   &childInd.Name,
+						})
+						cvs.Edges = append(cvs.Edges, &canvas.Edge{
+							ID:       spID + "_" + childInd.ID,
+							FromNode: spID,
+							ToNode:   childInd.ID,
+							FromSide: strptr("right"),
+							ToSide:   strptr("left"),
+						})
+						cvs.Edges = append(cvs.Edges, &canvas.Edge{
+							ID:       childInd.ID + "_" + spID,
+							FromNode: childInd.ID,
+							ToNode:   spID,
+							FromSide: strptr("left"),
+							ToSide:   strptr("right"),
+						})
+					}
+
+				}
+			}
 		}
 		for _, ch := range n.Children {
 			// Check if the child is also a child of the spouse
