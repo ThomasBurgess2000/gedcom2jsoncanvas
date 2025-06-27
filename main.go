@@ -157,7 +157,7 @@ func buildDescTree(m *Model, root string) *TNode {
 		ind := m.Indi[cur.Key]
 		if ind == nil || len(ind.SpouseFams) == 0 {
 			if debug {
-				log.Printf("no spouse families for %s", ind.Name)
+				log.Printf("no spouse families for %s", cur.Key)
 			}
 			continue
 		}
@@ -178,36 +178,7 @@ func buildDescTree(m *Model, root string) *TNode {
 			cur.SpouseKey = fam.Father
 		}
 
-		log.Printf("spouse of: %s is %s, adding", cur.Name, m.Indi[cur.SpouseKey].Name)
-		cur.SpouseKey = m.Indi[cur.SpouseKey].ID
-
-		// Check if spouse has siblings, and add them to the stack
-		if cur.SpouseKey != "" {
-			spouse := m.Indi[cur.SpouseKey]
-			if spouse.ChildFam != "" {
-
-				spouseFam := m.Fam[spouse.ChildFam]
-
-				for _, child := range spouseFam.Children {
-					childInd := m.Indi[normalizePtr(child)]
-					if childInd == nil {
-						log.Printf("warning: child %q referenced in family %q not found", child, spouse.ChildFam)
-						continue
-					}
-					if childInd.ID != cur.SpouseKey {
-						stack = append(stack, &TNode{
-							Key:        childInd.ID,
-							Name:       childInd.Name,
-							Birth:      childInd.Birth,
-							Generation: cur.Generation,
-						})
-					}
-				}
-			}
-		}
-
 		// children
-		log.Printf("Checking children of: %s", cur.Name)
 		for _, c := range fam.Children {
 			chInd := m.Indi[normalizePtr(c)]
 			if chInd == nil {
@@ -215,7 +186,7 @@ func buildDescTree(m *Model, root string) *TNode {
 				continue
 			}
 			if debug {
-				log.Printf("adding child %s to %s", chInd.Name, cur.Name)
+				log.Printf("adding child %s to %s", c, cur.Key)
 			}
 			child := &TNode{
 				Key:        c,
@@ -264,42 +235,17 @@ func layout(root *TNode) {
 	setY(root)
 }
 
-// assignX recursively assigns horizontal positions. Each node normally
-// occupies one "column". If the node has a spouse, we reserve an extra column
-// immediately to its right so the spouse can be drawn without overlapping
-// subsequent nodes.
+// assignX recursively assigns horizontal positions.
 func assignX(n *TNode, next *float64) {
 	if len(n.Children) == 0 {
-		// Leaf node: place the individual at the current column.
 		n.X = *next
-
-		// Advance the cursor, reserving an extra space if we also need to
-		// draw a spouse next to this individual.
-		if n.SpouseKey != "" {
-			*next += 2 // individual + spouse
-		} else {
-			*next += 1
-		}
+		*next += 1
 		return
 	}
-
-	// Interior node: layout children first.
 	for _, c := range n.Children {
 		assignX(c, next)
 	}
-
-	// Centre the parent above its leftmost and rightmost children.
 	n.X = (n.Children[0].X + n.Children[len(n.Children)-1].X) / 2
-
-	// If the parent has a spouse but also children, we still need to ensure
-	// space to render the spouse. We do this by checking whether the spouse
-	// would collide with the first node allocated after the subtree. If the
-	// cursor is currently equal to n.X (i.e. no new columns were created by
-	// laying out the children to the right of the parent) we bump it by one
-	// extra column so the spouse has room.
-	if n.SpouseKey != "" && *next == n.X+1 {
-		*next += 1
-	}
 }
 
 func findMinX(n *TNode, currentMin float64) float64 {
@@ -348,131 +294,77 @@ const (
 
 func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 	model := buildModel(doc)
-	tree := buildDescTree(model, root)
-	layout(tree)
-
 	var cvs canvas.Canvas
-	var nodes []*TNode
-	collect(&nodes, tree)
 
-	// build quick lookup for node positions (by key)
-	nodeByKey := make(map[string]*TNode, len(nodes))
-	for _, tn := range nodes {
-		nodeByKey[tn.Key] = tn
-	}
+	// build tree for every individual
+	for _, ind := range model.Indi {
+		tree := buildDescTree(model, ind.ID)
 
-	for _, n := range nodes {
-		id := n.Key
-		// GEDCOM NAME field is typically "Given /Surname/" but may vary.
-		parts := strings.Split(n.Name, "/")
-		var given, surname string
-		if len(parts) > 0 {
-			given = strings.TrimSpace(parts[0])
+		layout(tree)
+
+		var nodes []*TNode
+		collect(&nodes, tree)
+
+		// build quick lookup for node positions (by key)
+		nodeByKey := make(map[string]*TNode, len(nodes))
+		for _, tn := range nodes {
+			nodeByKey[tn.Key] = tn
 		}
-		if len(parts) > 1 {
-			surname = strings.TrimSpace(parts[1])
-		}
-		if given == "" && surname == "" {
-			given = strings.TrimSpace(n.Name)
-		}
-		text := fmt.Sprintf("%s\n%s", given, surname)
-		cvs.Nodes = append(cvs.Nodes, &canvas.Node{
-			ID:     id,
-			Type:   "text",
-			X:      int(n.X * xScale),
-			Y:      int(n.Y * yScale),
-			Width:  nodeW,
-			Height: nodeH,
-			Text:   &text,
-		})
-		log.Printf("Added node: %s", text)
-		if n.SpouseKey != "" {
-			spID := normalizePtr(n.SpouseKey)
-			spouseText := fmt.Sprintf(model.Indi[n.SpouseKey].Name)
 
-			// Position the spouse immediately to the right of the individual.
-			spX := n.X + 1
-
+		for _, n := range nodes {
+			id := n.Key
+			// GEDCOM NAME field is typically "Given /Surname/" but may vary.
+			parts := strings.Split(n.Name, "/")
+			var given, surname string
+			if len(parts) > 0 {
+				given = strings.TrimSpace(parts[0])
+			}
+			if len(parts) > 1 {
+				surname = strings.TrimSpace(parts[1])
+			}
+			if given == "" && surname == "" {
+				given = strings.TrimSpace(n.Name)
+			}
+			text := fmt.Sprintf("%s\n%s", given, surname)
 			cvs.Nodes = append(cvs.Nodes, &canvas.Node{
-				ID:     spID,
+				ID:     id,
 				Type:   "text",
-				X:      int(spX * xScale),
+				X:      int(n.X * xScale),
 				Y:      int(n.Y * yScale),
 				Width:  nodeW,
 				Height: nodeH,
-				Text:   &spouseText,
+				Text:   &text,
 			})
-
-			log.Printf("spouse of: %s is %s", n.Name, model.Indi[n.SpouseKey].Name)
-
-			cvs.Edges = append(cvs.Edges, &canvas.Edge{
-				ID:       id + "_" + spID,
-				FromNode: id,
-				ToNode:   spID,
-				FromSide: strptr("right"),
-				ToSide:   strptr("left"),
-			})
-			cvs.Edges = append(cvs.Edges, &canvas.Edge{
-				ID:       spID + "_" + id,
-				FromNode: spID,
-				ToNode:   id,
-				FromSide: strptr("left"),
-				ToSide:   strptr("right"),
-			})
-
-			// Check if the spouse has siblings, and add them to the canvas
-			if model.Indi[n.SpouseKey].ChildFam != "" {
-				spouseFam := model.Fam[model.Indi[n.SpouseKey].ChildFam]
-				for _, child := range spouseFam.Children {
-					childInd := model.Indi[normalizePtr(child)]
-					if childInd.ID != n.SpouseKey {
-						cvs.Nodes = append(cvs.Nodes, &canvas.Node{
-							ID:     childInd.ID,
-							Type:   "text",
-							X:      int(n.X * xScale),
-							Y:      int(n.Y * yScale),
-							Width:  nodeW,
-							Height: nodeH,
-							Text:   &childInd.Name,
-						})
-						cvs.Edges = append(cvs.Edges, &canvas.Edge{
-							ID:       spID + "_" + childInd.ID,
-							FromNode: spID,
-							ToNode:   childInd.ID,
-							FromSide: strptr("right"),
-							ToSide:   strptr("left"),
-						})
-						cvs.Edges = append(cvs.Edges, &canvas.Edge{
-							ID:       childInd.ID + "_" + spID,
-							FromNode: childInd.ID,
-							ToNode:   spID,
-							FromSide: strptr("left"),
-							ToSide:   strptr("right"),
-						})
-					}
-
-				}
-			}
-		}
-		for _, ch := range n.Children {
-			// Check if the child is also a child of the spouse
-			if model.Indi[ch.Key].ChildFam == model.Indi[n.SpouseKey].SpouseFams[0] {
+			if n.SpouseKey != "" {
 				spID := normalizePtr(n.SpouseKey)
+				label := "spouse"
+
+				// Decide edge sides based on horizontal positions.
+				fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+				if spNode, ok := nodeByKey[spID]; ok {
+					if n.X > spNode.X { // n is to the right of spouse
+						fromSide, toSide = "left", "right"
+					}
+				}
+
 				cvs.Edges = append(cvs.Edges, &canvas.Edge{
-					ID:       spID + "_" + ch.Key,
-					FromNode: spID,
+					ID:       id + "_" + spID,
+					FromNode: id,
+					ToNode:   spID,
+					FromSide: strptr(fromSide),
+					ToSide:   strptr(toSide),
+					Label:    &label,
+				})
+			}
+			for _, ch := range n.Children {
+				cvs.Edges = append(cvs.Edges, &canvas.Edge{
+					ID:       id + "_" + ch.Key,
+					FromNode: id,
 					ToNode:   ch.Key,
 					FromSide: strptr("bottom"),
 					ToSide:   strptr("top"),
 				})
 			}
-			cvs.Edges = append(cvs.Edges, &canvas.Edge{
-				ID:       id + "_" + ch.Key,
-				FromNode: id,
-				ToNode:   ch.Key,
-				FromSide: strptr("bottom"),
-				ToSide:   strptr("top"),
-			})
 		}
 	}
 	return &cvs
