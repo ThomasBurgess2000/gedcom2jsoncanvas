@@ -1,4 +1,4 @@
-package main
+package classic
 
 import (
 	"encoding/json"
@@ -136,6 +136,70 @@ type TNode struct {
 var debug bool // set via flag
 
 // ---------------------------------------------------------------------------
+// ancestor tree (child → parents)
+// ---------------------------------------------------------------------------
+func buildAncTree(m *Model, root string) *TNode {
+	r := &TNode{
+		Key:        root,
+		Name:       m.Indi[root].Name,
+		Birth:      m.Indi[root].Birth,
+		Generation: 1,
+	}
+	seen := map[string]*TNode{root: r}
+	stack := []*TNode{r}
+
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		ind := m.Indi[cur.Key]
+		if ind == nil || ind.ChildFam == "" {
+			continue
+		}
+		fam := m.Fam[ind.ChildFam]
+		if fam == nil {
+			continue
+		}
+
+		addParent := func(ptr string) {
+			if ptr == "" {
+				return
+			}
+			if p, ok := seen[ptr]; ok { // already inserted (e.g. pedigree loop)
+				cur.Children = append(cur.Children, p)
+				return
+			}
+			pi := m.Indi[ptr]
+			if pi == nil {
+				return
+			}
+			node := &TNode{
+				Key:        ptr,
+				Name:       pi.Name,
+				Birth:      pi.Birth,
+				Generation: cur.Generation + 1,
+			}
+			// spouse link for parents
+			if fam.Father == ptr && fam.Mother != "" {
+				node.SpouseKey = fam.Mother
+			}
+			if fam.Mother == ptr && fam.Father != "" {
+				node.SpouseKey = fam.Father
+			}
+
+			seen[ptr] = node
+			cur.Children = append(cur.Children, node)
+			stack = append(stack, node)
+		}
+
+		addParent(fam.Father)
+		addParent(fam.Mother)
+	}
+	sortChildrenByBirth(r)
+	return r
+}
+
+// ---------------------------------------------------------------------------
 // descendant tree (parent → children)
 // ---------------------------------------------------------------------------
 func buildDescTree(m *Model, root string) *TNode {
@@ -177,9 +241,6 @@ func buildDescTree(m *Model, root string) *TNode {
 		} else if fam.Mother == cur.Key && fam.Father != "" {
 			cur.SpouseKey = fam.Father
 		}
-
-		log.Printf("spouse of: %s is %s, adding", cur.Name, m.Indi[cur.SpouseKey].Name)
-		cur.SpouseKey = m.Indi[cur.SpouseKey].ID
 
 		// children
 		for _, c := range fam.Children {
@@ -238,42 +299,17 @@ func layout(root *TNode) {
 	setY(root)
 }
 
-// assignX recursively assigns horizontal positions. Each node normally
-// occupies one "column". If the node has a spouse, we reserve an extra column
-// immediately to its right so the spouse can be drawn without overlapping
-// subsequent nodes.
+// assignX recursively assigns horizontal positions.
 func assignX(n *TNode, next *float64) {
 	if len(n.Children) == 0 {
-		// Leaf node: place the individual at the current column.
 		n.X = *next
-
-		// Advance the cursor, reserving an extra space if we also need to
-		// draw a spouse next to this individual.
-		if n.SpouseKey != "" {
-			*next += 2 // individual + spouse
-		} else {
-			*next += 1
-		}
+		*next += 1
 		return
 	}
-
-	// Interior node: layout children first.
 	for _, c := range n.Children {
 		assignX(c, next)
 	}
-
-	// Centre the parent above its leftmost and rightmost children.
 	n.X = (n.Children[0].X + n.Children[len(n.Children)-1].X) / 2
-
-	// If the parent has a spouse but also children, we still need to ensure
-	// space to render the spouse. We do this by checking whether the spouse
-	// would collide with the first node allocated after the subtree. If the
-	// cursor is currently equal to n.X (i.e. no new columns were created by
-	// laying out the children to the right of the parent) we bump it by one
-	// extra column so the spouse has room.
-	if n.SpouseKey != "" && *next == n.X+1 {
-		*next += 1
-	}
 }
 
 func findMinX(n *TNode, currentMin float64) float64 {
@@ -359,59 +395,116 @@ func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 			Height: nodeH,
 			Text:   &text,
 		})
-		log.Printf("Added node: %s", text)
 		if n.SpouseKey != "" {
 			spID := normalizePtr(n.SpouseKey)
-			spouseText := fmt.Sprintf(model.Indi[n.SpouseKey].Name)
+			label := "spouse"
 
-			// Position the spouse immediately to the right of the individual.
-			spX := n.X + 1
-
-			cvs.Nodes = append(cvs.Nodes, &canvas.Node{
-				ID:     spID,
-				Type:   "text",
-				X:      int(spX * xScale),
-				Y:      int(n.Y * yScale),
-				Width:  nodeW,
-				Height: nodeH,
-				Text:   &spouseText,
-			})
-
-			log.Printf("spouse of: %s is %s", n.Name, model.Indi[n.SpouseKey].Name)
+			// Decide edge sides based on horizontal positions.
+			fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+			if spNode, ok := nodeByKey[spID]; ok {
+				if n.X > spNode.X { // n is to the right of spouse
+					fromSide, toSide = "left", "right"
+				}
+			}
 
 			cvs.Edges = append(cvs.Edges, &canvas.Edge{
 				ID:       id + "_" + spID,
 				FromNode: id,
 				ToNode:   spID,
-				FromSide: strptr("right"),
-				ToSide:   strptr("left"),
-			})
-			cvs.Edges = append(cvs.Edges, &canvas.Edge{
-				ID:       spID + "_" + id,
-				FromNode: spID,
-				ToNode:   id,
-				FromSide: strptr("left"),
-				ToSide:   strptr("right"),
+				FromSide: strptr(fromSide),
+				ToSide:   strptr(toSide),
+				Label:    &label,
 			})
 		}
 		for _, ch := range n.Children {
-			// Check if the child is also a child of the spouse
-			if model.Indi[ch.Key].ChildFam == model.Indi[n.SpouseKey].SpouseFams[0] {
-				spID := normalizePtr(n.SpouseKey)
-				cvs.Edges = append(cvs.Edges, &canvas.Edge{
-					ID:       spID + "_" + ch.Key,
-					FromNode: spID,
-					ToNode:   ch.Key,
-					FromSide: strptr("bottom"),
-					ToSide:   strptr("top"),
-				})
-			}
 			cvs.Edges = append(cvs.Edges, &canvas.Edge{
 				ID:       id + "_" + ch.Key,
 				FromNode: id,
 				ToNode:   ch.Key,
 				FromSide: strptr("bottom"),
 				ToSide:   strptr("top"),
+			})
+		}
+	}
+	return &cvs
+}
+
+func BuildCanvasAnc(doc *ged.Document, root string) *canvas.Canvas {
+	model := buildModel(doc)
+	tree := buildAncTree(model, root)
+	layout(tree)
+
+	// deepest generation ⇒ used for vertical flip
+	maxGen := 0.0
+	var nodes []*TNode
+	collect(&nodes, tree)
+	for _, n := range nodes {
+		if n.Y > maxGen {
+			maxGen = n.Y
+		}
+	}
+
+	var cvs canvas.Canvas
+
+	// build quick lookup for node positions (by key)
+	nodeByKey := make(map[string]*TNode, len(nodes))
+	for _, tn := range nodes {
+		nodeByKey[tn.Key] = tn
+	}
+
+	for _, n := range nodes {
+		id := n.Key
+		yPix := int((maxGen - n.Y) * yScale) // flip
+
+		parts := strings.Split(n.Name, "/")
+		given, surname := "", ""
+		if len(parts) > 0 {
+			given = strings.TrimSpace(parts[0])
+		}
+		if len(parts) > 1 {
+			surname = strings.TrimSpace(parts[1])
+		}
+		if given == "" && surname == "" {
+			given = strings.TrimSpace(n.Name)
+		}
+		txt := fmt.Sprintf("%s\n%s", given, surname)
+
+		cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+			ID:     id,
+			Type:   "text",
+			X:      int(n.X * xScale),
+			Y:      yPix,
+			Width:  nodeW,
+			Height: nodeH,
+			Text:   &txt,
+		})
+
+		// spouse edge (if spouse actually present in tree)
+		if n.SpouseKey != "" {
+			spID := normalizePtr(n.SpouseKey)
+
+			// Decide edge sides based on horizontal positions.
+			fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+			if spNode, ok := nodeByKey[spID]; ok {
+				if n.X > spNode.X { // n is to the right of spouse
+					fromSide, toSide = "left", "right"
+				}
+			}
+
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       id + "_" + spID,
+				FromNode: id,
+				ToNode:   spID,
+				FromSide: strptr(fromSide),
+				ToSide:   strptr(toSide),
+			})
+		}
+		// parent → child edges  (note: n.Children are *parents*)
+		for _, p := range n.Children {
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       p.Key + "_" + id,
+				FromNode: p.Key, ToNode: id,
+				FromSide: strptr("bottom"), ToSide: strptr("top"),
 			})
 		}
 	}
@@ -428,7 +521,7 @@ func main() {
 	// Command-line flags
 	gedPath := flag.String("ged", "", "Path to the GEDCOM file")
 	rootPtr := flag.String("root", "", "Pointer of the root individual (e.g. @I1@)")
-	mode := flag.String("mode", "desc", "Tree mode: currently only 'desc' (descendants) is supported")
+	mode := flag.String("mode", "desc", "Tree mode: currently only 'desc' (descendants) and 'anc' (ancestors) are supported")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 
 	flag.Parse()
@@ -440,8 +533,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mode != "desc" {
-		log.Fatalf("unsupported mode %q (only 'desc' is implemented)", *mode)
+	if *mode != "desc" && *mode != "anc" {
+		log.Fatalf("unsupported mode %q (only 'desc' and 'anc' are implemented)", *mode)
 	}
 
 	raw, err := os.ReadFile(*gedPath)
@@ -458,12 +551,18 @@ func main() {
 		log.Fatalf("cannot resolve root: %v", err)
 	}
 
+	if debug {
+		log.Printf("debug mode on")
+	}
+
 	var cvs *canvas.Canvas
 	switch *mode {
 	case "desc":
 		cvs = BuildCanvas(doc, resolvedPtr)
+	case "anc":
+		cvs = BuildCanvasAnc(doc, resolvedPtr)
 	default:
-		log.Fatalf("unsupported mode %q (only 'desc' is implemented)", *mode)
+		log.Fatalf("unsupported mode %q (only 'desc' and 'anc' are implemented)", *mode)
 	}
 
 	data, _ := json.MarshalIndent(cvs, "", "  ")
