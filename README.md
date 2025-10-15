@@ -5,3 +5,10 @@ This was a work in progress I never completed. Generated JSONCanvas (compatible 
 Here is an example of the ancestor mapping:
 
 <img width="2501" height="1539" alt="image" src="https://github.com/user-attachments/assets/7d3a27e9-c3de-43db-b42f-bc82afe312f9" />
+
+## Getting Started
+To generate the example ancestor mapping yourself from the test.ged file, use: 
+
+```
+go run main.go -ged test.ged -root I54 -mode anc
+```
