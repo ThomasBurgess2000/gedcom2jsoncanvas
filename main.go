@@ -15,10 +15,6 @@ import (
 )
 
 // ----------------------------------------------------------------------------
-// Idea: You can assign every individual a generation number by starting at the furthest ancestor and working your way down. Do BFS through families and assign generation numbers to each individual.
-// ----------------------------------------------------------------------------
-
-// ----------------------------------------------------------------------------
 // GEDCOM flattening
 // ----------------------------------------------------------------------------
 
@@ -27,7 +23,7 @@ type Individual struct {
 	Name       string
 	Birth      string
 	Sex        string
-	ChildFams  []string // FAMC
+	ChildFam   string   // FAMC
 	SpouseFams []string // many FAMS tags
 }
 
@@ -63,14 +59,8 @@ func spouseFamilyPointers(ind *ged.IndividualNode) []string {
 // childFamilyPointer returns the family pointer where ind is listed as a child,
 // or "" if none exists. Pointer comparisons are normalised so that different
 // capitalisation or surrounding "@" delimiters do not break the lookup.
-func childFamilyPointers(ind *ged.IndividualNode) []string {
-	var famPtrs []string
-	for _, fam := range ind.Families() {
-		if fam.HasChild(ind) {
-			famPtrs = append(famPtrs, fam.Pointer())
-		}
-	}
-	return famPtrs
+func childFamilyPointer(ind *ged.IndividualNode, childToFam map[string]string) string {
+	return childToFam[normalizePtr(ind.Pointer())]
 }
 
 // ---------------------------------------------------------------------------
@@ -117,118 +107,12 @@ func buildModel(doc *ged.Document) *Model {
 		}
 
 		ind.SpouseFams = spouseFamilyPointers(n)
-		ind.ChildFams = childFamilyPointers(n)
+		ind.ChildFam = childFamilyPointer(n, childToFam)
 
 		m.Indi[ptr] = ind
 	}
 
 	return m
-}
-
-func assignGenerations(m *Model, root string) {
-	queue := []*TNode{
-		{
-			Key:        root,
-			Generation: 1,
-		},
-	}
-
-	finalMap := make(map[string]int)
-
-	finalMap[root] = 1
-
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		ind := m.Indi[cur.Key]
-		if ind == nil {
-			log.Printf("warning: individual %q not found in GEDCOM", cur.Key)
-			continue
-		}
-		for _, fam := range ind.SpouseFams {
-			fam := m.Fam[fam]
-			if fam == nil {
-				log.Printf("warning: family %q referenced by %q not found", fam, ind.ID)
-				continue
-			}
-			if fam.Father != "" && fam.Father != ind.ID {
-				if _, ok := finalMap[fam.Father]; !ok {
-					queue = append(queue, &TNode{
-						Key:        fam.Father,
-						Generation: cur.Generation,
-					})
-				}
-				finalMap[fam.Father] = cur.Generation
-			}
-			if fam.Mother != "" && fam.Mother != ind.ID {
-				if _, ok := finalMap[fam.Mother]; !ok {
-					queue = append(queue, &TNode{
-						Key:        fam.Mother,
-						Generation: cur.Generation,
-					})
-				}
-				finalMap[fam.Mother] = cur.Generation
-
-			}
-			for _, child := range fam.Children {
-				finalMap[child] = cur.Generation + 1
-				queue = append(queue, &TNode{
-					Key:        child,
-					Generation: cur.Generation + 1,
-				})
-			}
-		}
-		for _, childFam := range ind.ChildFams {
-			childFam := m.Fam[childFam]
-			if childFam != nil {
-				for _, child := range childFam.Children {
-					if child != ind.ID {
-						if _, ok := finalMap[child]; !ok {
-							log.Printf("adding sibling of %s, %s, to queue", ind.Name, m.Indi[child].Name)
-							finalMap[child] = cur.Generation
-							queue = append(queue, &TNode{
-								Key:        child,
-								Generation: cur.Generation,
-							})
-						}
-					}
-				}
-				if childFam.Father != "" && childFam.Father != ind.ID {
-					if _, ok := finalMap[childFam.Father]; !ok {
-						queue = append(queue, &TNode{
-							Key:        childFam.Father,
-							Generation: cur.Generation - 1,
-						})
-						finalMap[childFam.Father] = cur.Generation - 1
-					}
-				}
-				if childFam.Mother != "" && childFam.Mother != ind.ID {
-					if _, ok := finalMap[childFam.Mother]; !ok {
-						queue = append(queue, &TNode{
-							Key:        childFam.Mother,
-							Generation: cur.Generation - 1,
-						})
-						finalMap[childFam.Mother] = cur.Generation - 1
-					}
-				}
-			}
-		}
-	}
-
-	noGenerationArray := make([]string, 0)
-
-	for _, ind := range m.Indi {
-		if generation, ok := finalMap[ind.ID]; ok {
-			log.Printf("individual %s has generation %d", ind.Name, generation)
-		} else {
-			log.Printf("individual %s has no generation", ind.Name)
-			noGenerationArray = append(noGenerationArray, ind.Name)
-		}
-	}
-
-	log.Printf("%d individuals have generations out of %d", len(finalMap), len(m.Indi))
-	log.Printf("%d individuals have no generation", len(noGenerationArray))
-	log.Printf("%v", noGenerationArray)
 }
 
 // ----------------------------------------------------------------------------
@@ -250,6 +134,70 @@ type TNode struct {
 }
 
 var debug bool // set via flag
+
+// ---------------------------------------------------------------------------
+// ancestor tree (child → parents)
+// ---------------------------------------------------------------------------
+func buildAncTree(m *Model, root string) *TNode {
+	r := &TNode{
+		Key:        root,
+		Name:       m.Indi[root].Name,
+		Birth:      m.Indi[root].Birth,
+		Generation: 1,
+	}
+	seen := map[string]*TNode{root: r}
+	stack := []*TNode{r}
+
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		ind := m.Indi[cur.Key]
+		if ind == nil || ind.ChildFam == "" {
+			continue
+		}
+		fam := m.Fam[ind.ChildFam]
+		if fam == nil {
+			continue
+		}
+
+		addParent := func(ptr string) {
+			if ptr == "" {
+				return
+			}
+			if p, ok := seen[ptr]; ok { // already inserted (e.g. pedigree loop)
+				cur.Children = append(cur.Children, p)
+				return
+			}
+			pi := m.Indi[ptr]
+			if pi == nil {
+				return
+			}
+			node := &TNode{
+				Key:        ptr,
+				Name:       pi.Name,
+				Birth:      pi.Birth,
+				Generation: cur.Generation + 1,
+			}
+			// spouse link for parents
+			if fam.Father == ptr && fam.Mother != "" {
+				node.SpouseKey = fam.Mother
+			}
+			if fam.Mother == ptr && fam.Father != "" {
+				node.SpouseKey = fam.Father
+			}
+
+			seen[ptr] = node
+			cur.Children = append(cur.Children, node)
+			stack = append(stack, node)
+		}
+
+		addParent(fam.Father)
+		addParent(fam.Mother)
+	}
+	sortChildrenByBirth(r)
+	return r
+}
 
 // ---------------------------------------------------------------------------
 // descendant tree (parent → children)
@@ -410,13 +358,10 @@ const (
 
 func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 	model := buildModel(doc)
-	assignGenerations(model, root)
-	var cvs canvas.Canvas
-
 	tree := buildDescTree(model, root)
-
 	layout(tree)
 
+	var cvs canvas.Canvas
 	var nodes []*TNode
 	collect(&nodes, tree)
 
@@ -481,7 +426,88 @@ func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 			})
 		}
 	}
+	return &cvs
+}
 
+func BuildCanvasAnc(doc *ged.Document, root string) *canvas.Canvas {
+	model := buildModel(doc)
+	tree := buildAncTree(model, root)
+	layout(tree)
+
+	// deepest generation ⇒ used for vertical flip
+	maxGen := 0.0
+	var nodes []*TNode
+	collect(&nodes, tree)
+	for _, n := range nodes {
+		if n.Y > maxGen {
+			maxGen = n.Y
+		}
+	}
+
+	var cvs canvas.Canvas
+
+	// build quick lookup for node positions (by key)
+	nodeByKey := make(map[string]*TNode, len(nodes))
+	for _, tn := range nodes {
+		nodeByKey[tn.Key] = tn
+	}
+
+	for _, n := range nodes {
+		id := n.Key
+		yPix := int((maxGen - n.Y) * yScale) // flip
+
+		parts := strings.Split(n.Name, "/")
+		given, surname := "", ""
+		if len(parts) > 0 {
+			given = strings.TrimSpace(parts[0])
+		}
+		if len(parts) > 1 {
+			surname = strings.TrimSpace(parts[1])
+		}
+		if given == "" && surname == "" {
+			given = strings.TrimSpace(n.Name)
+		}
+		txt := fmt.Sprintf("%s\n%s", given, surname)
+
+		cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+			ID:     id,
+			Type:   "text",
+			X:      int(n.X * xScale),
+			Y:      yPix,
+			Width:  nodeW,
+			Height: nodeH,
+			Text:   &txt,
+		})
+
+		// spouse edge (if spouse actually present in tree)
+		if n.SpouseKey != "" {
+			spID := normalizePtr(n.SpouseKey)
+
+			// Decide edge sides based on horizontal positions.
+			fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+			if spNode, ok := nodeByKey[spID]; ok {
+				if n.X > spNode.X { // n is to the right of spouse
+					fromSide, toSide = "left", "right"
+				}
+			}
+
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       id + "_" + spID,
+				FromNode: id,
+				ToNode:   spID,
+				FromSide: strptr(fromSide),
+				ToSide:   strptr(toSide),
+			})
+		}
+		// parent → child edges  (note: n.Children are *parents*)
+		for _, p := range n.Children {
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       p.Key + "_" + id,
+				FromNode: p.Key, ToNode: id,
+				FromSide: strptr("bottom"), ToSide: strptr("top"),
+			})
+		}
+	}
 	return &cvs
 }
 
@@ -495,7 +521,7 @@ func main() {
 	// Command-line flags
 	gedPath := flag.String("ged", "", "Path to the GEDCOM file")
 	rootPtr := flag.String("root", "", "Pointer of the root individual (e.g. @I1@)")
-	mode := flag.String("mode", "desc", "Tree mode: currently only 'desc' (descendants) is supported")
+	mode := flag.String("mode", "desc", "Tree mode: currently only 'desc' (descendants) and 'anc' (ancestors) are supported")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 
 	flag.Parse()
@@ -507,8 +533,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mode != "desc" {
-		log.Fatalf("unsupported mode %q (only 'desc' is implemented)", *mode)
+	if *mode != "desc" && *mode != "anc" {
+		log.Fatalf("unsupported mode %q (only 'desc' and 'anc' are implemented)", *mode)
 	}
 
 	raw, err := os.ReadFile(*gedPath)
@@ -529,8 +555,10 @@ func main() {
 	switch *mode {
 	case "desc":
 		cvs = BuildCanvas(doc, resolvedPtr)
+	case "anc":
+		cvs = BuildCanvasAnc(doc, resolvedPtr)
 	default:
-		log.Fatalf("unsupported mode %q (only 'desc' is implemented)", *mode)
+		log.Fatalf("unsupported mode %q (only 'desc' and 'anc' are implemented)", *mode)
 	}
 
 	data, _ := json.MarshalIndent(cvs, "", "  ")
