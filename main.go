@@ -15,6 +15,10 @@ import (
 )
 
 // ----------------------------------------------------------------------------
+// Idea: You can assign every individual a generation number by starting at the furthest ancestor and working your way down. Do BFS through families and assign generation numbers to each individual.
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
 // GEDCOM flattening
 // ----------------------------------------------------------------------------
 
@@ -23,7 +27,7 @@ type Individual struct {
 	Name       string
 	Birth      string
 	Sex        string
-	ChildFam   string   // FAMC
+	ChildFams  []string // FAMC
 	SpouseFams []string // many FAMS tags
 }
 
@@ -59,8 +63,14 @@ func spouseFamilyPointers(ind *ged.IndividualNode) []string {
 // childFamilyPointer returns the family pointer where ind is listed as a child,
 // or "" if none exists. Pointer comparisons are normalised so that different
 // capitalisation or surrounding "@" delimiters do not break the lookup.
-func childFamilyPointer(ind *ged.IndividualNode, childToFam map[string]string) string {
-	return childToFam[normalizePtr(ind.Pointer())]
+func childFamilyPointers(ind *ged.IndividualNode) []string {
+	var famPtrs []string
+	for _, fam := range ind.Families() {
+		if fam.HasChild(ind) {
+			famPtrs = append(famPtrs, fam.Pointer())
+		}
+	}
+	return famPtrs
 }
 
 // ---------------------------------------------------------------------------
@@ -107,12 +117,118 @@ func buildModel(doc *ged.Document) *Model {
 		}
 
 		ind.SpouseFams = spouseFamilyPointers(n)
-		ind.ChildFam = childFamilyPointer(n, childToFam)
+		ind.ChildFams = childFamilyPointers(n)
 
 		m.Indi[ptr] = ind
 	}
 
 	return m
+}
+
+func assignGenerations(m *Model, root string) {
+	queue := []*TNode{
+		{
+			Key:        root,
+			Generation: 1,
+		},
+	}
+
+	finalMap := make(map[string]int)
+
+	finalMap[root] = 1
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		ind := m.Indi[cur.Key]
+		if ind == nil {
+			log.Printf("warning: individual %q not found in GEDCOM", cur.Key)
+			continue
+		}
+		for _, fam := range ind.SpouseFams {
+			fam := m.Fam[fam]
+			if fam == nil {
+				log.Printf("warning: family %q referenced by %q not found", fam, ind.ID)
+				continue
+			}
+			if fam.Father != "" && fam.Father != ind.ID {
+				if _, ok := finalMap[fam.Father]; !ok {
+					queue = append(queue, &TNode{
+						Key:        fam.Father,
+						Generation: cur.Generation,
+					})
+				}
+				finalMap[fam.Father] = cur.Generation
+			}
+			if fam.Mother != "" && fam.Mother != ind.ID {
+				if _, ok := finalMap[fam.Mother]; !ok {
+					queue = append(queue, &TNode{
+						Key:        fam.Mother,
+						Generation: cur.Generation,
+					})
+				}
+				finalMap[fam.Mother] = cur.Generation
+
+			}
+			for _, child := range fam.Children {
+				finalMap[child] = cur.Generation + 1
+				queue = append(queue, &TNode{
+					Key:        child,
+					Generation: cur.Generation + 1,
+				})
+			}
+		}
+		for _, childFam := range ind.ChildFams {
+			childFam := m.Fam[childFam]
+			if childFam != nil {
+				for _, child := range childFam.Children {
+					if child != ind.ID {
+						if _, ok := finalMap[child]; !ok {
+							log.Printf("adding sibling of %s, %s, to queue", ind.Name, m.Indi[child].Name)
+							finalMap[child] = cur.Generation
+							queue = append(queue, &TNode{
+								Key:        child,
+								Generation: cur.Generation,
+							})
+						}
+					}
+				}
+				if childFam.Father != "" && childFam.Father != ind.ID {
+					if _, ok := finalMap[childFam.Father]; !ok {
+						queue = append(queue, &TNode{
+							Key:        childFam.Father,
+							Generation: cur.Generation - 1,
+						})
+						finalMap[childFam.Father] = cur.Generation - 1
+					}
+				}
+				if childFam.Mother != "" && childFam.Mother != ind.ID {
+					if _, ok := finalMap[childFam.Mother]; !ok {
+						queue = append(queue, &TNode{
+							Key:        childFam.Mother,
+							Generation: cur.Generation - 1,
+						})
+						finalMap[childFam.Mother] = cur.Generation - 1
+					}
+				}
+			}
+		}
+	}
+
+	noGenerationArray := make([]string, 0)
+
+	for _, ind := range m.Indi {
+		if generation, ok := finalMap[ind.ID]; ok {
+			log.Printf("individual %s has generation %d", ind.Name, generation)
+		} else {
+			log.Printf("individual %s has no generation", ind.Name)
+			noGenerationArray = append(noGenerationArray, ind.Name)
+		}
+	}
+
+	log.Printf("%d individuals have generations out of %d", len(finalMap), len(m.Indi))
+	log.Printf("%d individuals have no generation", len(noGenerationArray))
+	log.Printf("%v", noGenerationArray)
 }
 
 // ----------------------------------------------------------------------------
@@ -294,79 +410,78 @@ const (
 
 func BuildCanvas(doc *ged.Document, root string) *canvas.Canvas {
 	model := buildModel(doc)
+	assignGenerations(model, root)
 	var cvs canvas.Canvas
 
-	// build tree for every individual
-	for _, ind := range model.Indi {
-		tree := buildDescTree(model, ind.ID)
+	tree := buildDescTree(model, root)
 
-		layout(tree)
+	layout(tree)
 
-		var nodes []*TNode
-		collect(&nodes, tree)
+	var nodes []*TNode
+	collect(&nodes, tree)
 
-		// build quick lookup for node positions (by key)
-		nodeByKey := make(map[string]*TNode, len(nodes))
-		for _, tn := range nodes {
-			nodeByKey[tn.Key] = tn
+	// build quick lookup for node positions (by key)
+	nodeByKey := make(map[string]*TNode, len(nodes))
+	for _, tn := range nodes {
+		nodeByKey[tn.Key] = tn
+	}
+
+	for _, n := range nodes {
+		id := n.Key
+		// GEDCOM NAME field is typically "Given /Surname/" but may vary.
+		parts := strings.Split(n.Name, "/")
+		var given, surname string
+		if len(parts) > 0 {
+			given = strings.TrimSpace(parts[0])
 		}
+		if len(parts) > 1 {
+			surname = strings.TrimSpace(parts[1])
+		}
+		if given == "" && surname == "" {
+			given = strings.TrimSpace(n.Name)
+		}
+		text := fmt.Sprintf("%s\n%s", given, surname)
+		cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+			ID:     id,
+			Type:   "text",
+			X:      int(n.X * xScale),
+			Y:      int(n.Y * yScale),
+			Width:  nodeW,
+			Height: nodeH,
+			Text:   &text,
+		})
+		if n.SpouseKey != "" {
+			spID := normalizePtr(n.SpouseKey)
+			label := "spouse"
 
-		for _, n := range nodes {
-			id := n.Key
-			// GEDCOM NAME field is typically "Given /Surname/" but may vary.
-			parts := strings.Split(n.Name, "/")
-			var given, surname string
-			if len(parts) > 0 {
-				given = strings.TrimSpace(parts[0])
-			}
-			if len(parts) > 1 {
-				surname = strings.TrimSpace(parts[1])
-			}
-			if given == "" && surname == "" {
-				given = strings.TrimSpace(n.Name)
-			}
-			text := fmt.Sprintf("%s\n%s", given, surname)
-			cvs.Nodes = append(cvs.Nodes, &canvas.Node{
-				ID:     id,
-				Type:   "text",
-				X:      int(n.X * xScale),
-				Y:      int(n.Y * yScale),
-				Width:  nodeW,
-				Height: nodeH,
-				Text:   &text,
-			})
-			if n.SpouseKey != "" {
-				spID := normalizePtr(n.SpouseKey)
-				label := "spouse"
-
-				// Decide edge sides based on horizontal positions.
-				fromSide, toSide := "right", "left" // defaults (n on left of spouse)
-				if spNode, ok := nodeByKey[spID]; ok {
-					if n.X > spNode.X { // n is to the right of spouse
-						fromSide, toSide = "left", "right"
-					}
+			// Decide edge sides based on horizontal positions.
+			fromSide, toSide := "right", "left" // defaults (n on left of spouse)
+			if spNode, ok := nodeByKey[spID]; ok {
+				if n.X > spNode.X { // n is to the right of spouse
+					fromSide, toSide = "left", "right"
 				}
+			}
 
-				cvs.Edges = append(cvs.Edges, &canvas.Edge{
-					ID:       id + "_" + spID,
-					FromNode: id,
-					ToNode:   spID,
-					FromSide: strptr(fromSide),
-					ToSide:   strptr(toSide),
-					Label:    &label,
-				})
-			}
-			for _, ch := range n.Children {
-				cvs.Edges = append(cvs.Edges, &canvas.Edge{
-					ID:       id + "_" + ch.Key,
-					FromNode: id,
-					ToNode:   ch.Key,
-					FromSide: strptr("bottom"),
-					ToSide:   strptr("top"),
-				})
-			}
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       id + "_" + spID,
+				FromNode: id,
+				ToNode:   spID,
+				FromSide: strptr(fromSide),
+				ToSide:   strptr(toSide),
+				Label:    &label,
+			})
+		}
+		for _, ch := range n.Children {
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       id + "_" + ch.Key,
+				FromNode: id,
+				ToNode:   ch.Key,
+				FromSide: strptr("bottom"),
+				ToSide:   strptr("top"),
+			})
 		}
 	}
+
 	return &cvs
 }
 
