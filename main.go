@@ -805,6 +805,496 @@ func BuildCanvasAnc(doc *ged.Document, root string) *canvas.Canvas {
 
 func strptr(s string) *string { return &s }
 
+// ---------------------------------------------------------------------------
+// ancsp mode: ancestors with spouses, siblings & descendants
+// ---------------------------------------------------------------------------
+
+// CrossEdge represents a connection between two trees (e.g. a marriage
+// connecting two lineages).
+type CrossEdge struct {
+	FromConnKey string // connector node in source tree
+	ToChildKey  string // child node in destination tree
+}
+
+// findAllAncestors does a BFS upward from rootID, returning every ancestor's
+// ID mapped to their absolute generation number (root=0, parents=1, etc.).
+func findAllAncestors(m *Model, rootID string) map[string]int {
+	ancestors := map[string]int{rootID: 0}
+	queue := []string{rootID}
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		gen := ancestors[cur]
+
+		ind := m.Indi[cur]
+		if ind == nil || ind.ChildFam == "" {
+			continue
+		}
+		fam := m.Fam[ind.ChildFam]
+		if fam == nil {
+			continue
+		}
+		for _, parentID := range []string{fam.Father, fam.Mother} {
+			if parentID == "" {
+				continue
+			}
+			if _, already := ancestors[parentID]; already {
+				continue
+			}
+			if m.Indi[parentID] == nil {
+				continue
+			}
+			ancestors[parentID] = gen + 1
+			queue = append(queue, parentID)
+		}
+	}
+	return ancestors
+}
+
+// LineageRoot identifies the oldest known ancestor in a lineage along with
+// their generation number and pedigree path for ordering.
+type LineageRoot struct {
+	ID          string
+	Generation  int
+	PedigreeBit uint64 // binary path: 0=father, 1=mother at each step
+	PathLen     int    // number of steps from root person to this ancestor
+}
+
+// findLineageRoots walks the ancestor map and finds people with no known
+// parents in the data. They are returned in pedigree order (paternal-first).
+func findLineageRoots(m *Model, rootID string, ancestors map[string]int) []LineageRoot {
+	// Build pedigree paths: BFS from root, tracking the binary path.
+	type entry struct {
+		id      string
+		bit     uint64
+		pathLen int
+	}
+
+	pedigree := make(map[string]entry)
+	queue := []entry{{id: rootID, bit: 0, pathLen: 0}}
+	pedigree[rootID] = queue[0]
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		ind := m.Indi[cur.id]
+		if ind == nil || ind.ChildFam == "" {
+			continue
+		}
+		fam := m.Fam[ind.ChildFam]
+		if fam == nil {
+			continue
+		}
+
+		// Father: shift left, add 0 (father bit)
+		if fam.Father != "" {
+			if _, ok := ancestors[fam.Father]; ok {
+				if _, seen := pedigree[fam.Father]; !seen {
+					e := entry{
+						id:      fam.Father,
+						bit:     cur.bit << 1, // father = 0 bit
+						pathLen: cur.pathLen + 1,
+					}
+					pedigree[fam.Father] = e
+					queue = append(queue, e)
+				}
+			}
+		}
+		// Mother: shift left, add 1 (mother bit)
+		if fam.Mother != "" {
+			if _, ok := ancestors[fam.Mother]; ok {
+				if _, seen := pedigree[fam.Mother]; !seen {
+					e := entry{
+						id:      fam.Mother,
+						bit:     (cur.bit << 1) | 1, // mother = 1 bit
+						pathLen: cur.pathLen + 1,
+					}
+					pedigree[fam.Mother] = e
+					queue = append(queue, e)
+				}
+			}
+		}
+	}
+
+	// Collect roots: ancestors who have no parents in the data.
+	var roots []LineageRoot
+	for id, gen := range ancestors {
+		ind := m.Indi[id]
+		if ind == nil {
+			continue
+		}
+		isRoot := true
+		if ind.ChildFam != "" {
+			fam := m.Fam[ind.ChildFam]
+			if fam != nil {
+				if fam.Father != "" && ancestors[fam.Father] > 0 {
+					isRoot = false
+				}
+				if fam.Mother != "" && ancestors[fam.Mother] > 0 {
+					isRoot = false
+				}
+				// Also check if parents exist in ancestors map at all
+				if _, ok := ancestors[fam.Father]; ok && fam.Father != "" {
+					isRoot = false
+				}
+				if _, ok := ancestors[fam.Mother]; ok && fam.Mother != "" {
+					isRoot = false
+				}
+			}
+		}
+		if isRoot {
+			pe := pedigree[id]
+			roots = append(roots, LineageRoot{
+				ID:          id,
+				Generation:  gen,
+				PedigreeBit: pe.bit,
+				PathLen:     pe.pathLen,
+			})
+		}
+	}
+
+	// Sort by pedigree path: shorter paths first (closer to paternal line),
+	// then by bit value (father=0 before mother=1).
+	sort.Slice(roots, func(i, j int) bool {
+		if roots[i].PathLen != roots[j].PathLen {
+			return roots[i].PathLen < roots[j].PathLen
+		}
+		return roots[i].PedigreeBit < roots[j].PedigreeBit
+	})
+
+	return roots
+}
+
+// buildLineageDescTree builds a full descendant tree from a lineage root,
+// going downward. It tracks which people have already been placed in a
+// previous tree via the `seen` map to avoid duplicates.
+func buildLineageDescTree(m *Model, rootID string, gen int, seen map[string]bool, crossEdges *[]CrossEdge) *TNode {
+	rootInd := m.Indi[rootID]
+	if rootInd == nil {
+		return nil
+	}
+
+	root := &TNode{
+		Key:        rootID,
+		Name:       rootInd.Name,
+		Birth:      rootInd.Birth,
+		Generation: gen,
+	}
+	seen[rootID] = true
+
+	type workItem struct {
+		node   *TNode
+		famIdx int // which spouse family to process
+	}
+
+	stack := []workItem{{node: root, famIdx: 0}}
+
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		ind := m.Indi[cur.node.Key]
+		if ind == nil || len(ind.SpouseFams) == 0 {
+			continue
+		}
+
+		for i, famPtr := range ind.SpouseFams {
+			fam := m.Fam[famPtr]
+			if fam == nil {
+				continue
+			}
+
+			// Determine spouse
+			spKey := ""
+			if fam.Father == cur.node.Key && fam.Mother != "" {
+				spKey = fam.Mother
+			} else if fam.Mother == cur.node.Key && fam.Father != "" {
+				spKey = fam.Father
+			}
+
+			// Create spouse node for first marriage
+			if i == 0 && spKey != "" {
+				spInd := m.Indi[spKey]
+				if spInd != nil {
+					cur.node.Spouse = &TNode{
+						Key:        spKey,
+						Name:       spInd.Name,
+						Birth:      spInd.Birth,
+						Generation: cur.node.Generation,
+					}
+					seen[spKey] = true
+				}
+			}
+
+			// Add children — use connector key if spouse exists, person key otherwise
+			parentKey := cur.node.Key
+			if cur.node.Spouse != nil {
+				parentKey = cur.node.Key + "_conn"
+			}
+			for _, c := range fam.Children {
+				cNorm := normalizePtr(c)
+				if seen[cNorm] {
+					// Child already placed in another tree — record cross-edge
+					*crossEdges = append(*crossEdges, CrossEdge{
+						FromConnKey: parentKey,
+						ToChildKey:  cNorm,
+					})
+					continue
+				}
+
+				chInd := m.Indi[cNorm]
+				if chInd == nil {
+					continue
+				}
+				child := &TNode{
+					Key:        cNorm,
+					Name:       chInd.Name,
+					Birth:      chInd.Birth,
+					Generation: cur.node.Generation - 1,
+				}
+				cur.node.Children = append(cur.node.Children, child)
+				seen[cNorm] = true
+				stack = append(stack, workItem{node: child, famIdx: 0})
+			}
+			_ = i
+		}
+	}
+	sortChildrenByBirth(root)
+	return root
+}
+
+// BuildCanvasAncSp builds a canvas showing all ancestors of root with their
+// siblings, spouses, and full descendant trees.
+func BuildCanvasAncSp(doc *ged.Document, rootID string) *canvas.Canvas {
+	model := buildModel(doc)
+
+	// 1. Find all ancestors
+	ancestors := findAllAncestors(model, rootID)
+
+	// 2. Find lineage roots in pedigree order
+	lineageRoots := findLineageRoots(model, rootID, ancestors)
+
+	if debug {
+		log.Printf("Found %d ancestors, %d lineage roots", len(ancestors), len(lineageRoots))
+		for _, lr := range lineageRoots {
+			ind := model.Indi[lr.ID]
+			name := ""
+			if ind != nil {
+				name = ind.Name
+			}
+			log.Printf("  Lineage root: %s (%s) gen=%d pedigree=%b", lr.ID, name, lr.Generation, lr.PedigreeBit)
+		}
+	}
+
+	// 3. Build descendant trees from each lineage root
+	seen := make(map[string]bool)
+	var crossEdges []CrossEdge
+	var trees []*TNode
+
+	for _, lr := range lineageRoots {
+		if seen[lr.ID] {
+			continue // already placed as a spouse in a previous tree
+		}
+		tree := buildLineageDescTree(model, lr.ID, lr.Generation, seen, &crossEdges)
+		if tree != nil {
+			trees = append(trees, tree)
+		}
+	}
+
+	if debug {
+		log.Printf("Built %d trees, %d cross-edges", len(trees), len(crossEdges))
+	}
+
+	// 4. Layout each tree independently, then place side by side
+	var xOffset float64
+	for _, tree := range trees {
+		layoutWithSpouses(tree)
+
+		// Shift tree to the right of previous trees
+		if xOffset > 0 {
+			shiftWithSpouses(tree, xOffset)
+		}
+
+		// Find the rightmost X in this tree (including spouses)
+		maxX := findMaxXWithSpouses(tree)
+		xOffset = maxX + 3 // 3-unit gap between trees (was 2, +1 for spacing)
+	}
+
+	// 5. Find maxGen for Y flip (oldest at top)
+	maxGen := 0
+	for _, gen := range ancestors {
+		if gen > maxGen {
+			maxGen = gen
+		}
+	}
+
+	// 6. Emit canvas
+	var cvs canvas.Canvas
+	emitted := make(map[string]bool) // track emitted nodes to avoid duplicates
+
+	emitPerson := func(n *TNode) {
+		if emitted[n.Key] {
+			return
+		}
+		emitted[n.Key] = true
+
+		parts := strings.Split(n.Name, "/")
+		var given, surname string
+		if len(parts) > 0 {
+			given = strings.TrimSpace(parts[0])
+		}
+		if len(parts) > 1 {
+			surname = strings.TrimSpace(parts[1])
+		}
+		if given == "" && surname == "" {
+			given = strings.TrimSpace(n.Name)
+		}
+		text := fmt.Sprintf("%s\n%s", given, surname)
+
+		// Y flip: highest generation at top
+		yPos := int(float64(maxGen-n.Generation) * yScale)
+
+		cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+			ID:     n.Key,
+			Type:   "text",
+			X:      int(n.X * xScale),
+			Y:      yPos,
+			Width:  nodeW,
+			Height: nodeH,
+			Text:   &text,
+		})
+	}
+
+	emittedEdges := make(map[string]bool)
+
+	var walk func(n *TNode)
+	walk = func(n *TNode) {
+		emitPerson(n)
+
+		if n.Spouse != nil {
+			emitPerson(n.Spouse)
+
+			// Connector node
+			connID := n.Key + "_conn"
+			if !emitted[connID] {
+				emitted[connID] = true
+				yPos := int(float64(maxGen-n.Generation) * yScale)
+				connX := int(((n.X + n.Spouse.X) / 2) * xScale) + nodeW/2 - connectorSize/2
+				connY := yPos + nodeH/2 - connectorSize/2
+				blank := ""
+				cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+					ID:     connID,
+					Type:   "text",
+					X:      connX,
+					Y:      connY,
+					Width:  connectorSize,
+					Height: connectorSize,
+					Text:   &blank,
+				})
+
+				// Spouse edges
+				edgeID1 := connID + "_to_" + n.Key
+				if !emittedEdges[edgeID1] {
+					emittedEdges[edgeID1] = true
+					cvs.Edges = append(cvs.Edges, &canvas.Edge{
+						ID:       edgeID1,
+						FromNode: connID,
+						ToNode:   n.Key,
+						FromSide: strptr("left"),
+						ToSide:   strptr("right"),
+						FromEnd:  strptr("none"),
+						ToEnd:    strptr("arrow"),
+					})
+				}
+				edgeID2 := connID + "_to_" + n.Spouse.Key
+				if !emittedEdges[edgeID2] {
+					emittedEdges[edgeID2] = true
+					cvs.Edges = append(cvs.Edges, &canvas.Edge{
+						ID:       edgeID2,
+						FromNode: connID,
+						ToNode:   n.Spouse.Key,
+						FromSide: strptr("right"),
+						ToSide:   strptr("left"),
+						FromEnd:  strptr("none"),
+						ToEnd:    strptr("arrow"),
+					})
+				}
+			}
+
+			// Child edges from connector
+			connID2 := n.Key + "_conn"
+			for _, ch := range n.Children {
+				edgeID := connID2 + "_ch_" + ch.Key
+				if !emittedEdges[edgeID] {
+					emittedEdges[edgeID] = true
+					cvs.Edges = append(cvs.Edges, &canvas.Edge{
+						ID:       edgeID,
+						FromNode: connID2,
+						ToNode:   ch.Key,
+						FromSide: strptr("bottom"),
+						ToSide:   strptr("top"),
+					})
+				}
+			}
+		} else {
+			// No spouse: child edges directly from person
+			for _, ch := range n.Children {
+				edgeID := n.Key + "_ch_" + ch.Key
+				if !emittedEdges[edgeID] {
+					emittedEdges[edgeID] = true
+					cvs.Edges = append(cvs.Edges, &canvas.Edge{
+						ID:       edgeID,
+						FromNode: n.Key,
+						ToNode:   ch.Key,
+						FromSide: strptr("bottom"),
+						ToSide:   strptr("top"),
+					})
+				}
+			}
+		}
+
+		for _, ch := range n.Children {
+			walk(ch)
+		}
+	}
+
+	for _, tree := range trees {
+		walk(tree)
+	}
+
+	// 7. Emit cross-edges
+	for i, ce := range crossEdges {
+		edgeID := fmt.Sprintf("cross_%d_%s_%s", i, ce.FromConnKey, ce.ToChildKey)
+		cvs.Edges = append(cvs.Edges, &canvas.Edge{
+			ID:       edgeID,
+			FromNode: ce.FromConnKey,
+			ToNode:   ce.ToChildKey,
+			FromSide: strptr("bottom"),
+			ToSide:   strptr("top"),
+		})
+	}
+
+	return &cvs
+}
+
+// findMaxXWithSpouses returns the rightmost X value in a tree, including
+// spouse nodes.
+func findMaxXWithSpouses(n *TNode) float64 {
+	maxX := n.X
+	if n.Spouse != nil && n.Spouse.X > maxX {
+		maxX = n.Spouse.X
+	}
+	for _, c := range n.Children {
+		cx := findMaxXWithSpouses(c)
+		if cx > maxX {
+			maxX = cx
+		}
+	}
+	return maxX
+}
+
 // ----------------------------------------------------------------------------
 // Main (demo)
 // ----------------------------------------------------------------------------
@@ -813,7 +1303,7 @@ func main() {
 	// Command-line flags
 	gedPath := flag.String("ged", "", "Path to the GEDCOM file")
 	rootPtr := flag.String("root", "", "Pointer of the root individual (e.g. @I1@)")
-	mode := flag.String("mode", "desc", "Tree mode: 'desc' (descendants), 'anc' (ancestors), 'descsp' (descendants with spouses)")
+	mode := flag.String("mode", "desc", "Tree mode: 'desc' (descendants), 'anc' (ancestors), 'descsp' (descendants with spouses), 'ancsp' (ancestors with spouses/siblings/descendants)")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 
 	flag.Parse()
@@ -825,8 +1315,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mode != "desc" && *mode != "anc" && *mode != "descsp" {
-		log.Fatalf("unsupported mode %q (supported: 'desc', 'anc', 'descsp')", *mode)
+	if *mode != "desc" && *mode != "anc" && *mode != "descsp" && *mode != "ancsp" {
+		log.Fatalf("unsupported mode %q (supported: 'desc', 'anc', 'descsp', 'ancsp')", *mode)
 	}
 
 	raw, err := os.ReadFile(*gedPath)
@@ -851,6 +1341,8 @@ func main() {
 		cvs = BuildCanvasAnc(doc, resolvedPtr)
 	case "descsp":
 		cvs = BuildCanvasDescSp(doc, resolvedPtr)
+	case "ancsp":
+		cvs = BuildCanvasAncSp(doc, resolvedPtr)
 	default:
 		log.Fatalf("unsupported mode %q (supported: 'desc', 'anc', 'descsp')", *mode)
 	}
