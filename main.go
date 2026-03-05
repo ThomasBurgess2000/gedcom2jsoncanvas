@@ -643,7 +643,7 @@ func setY(n *TNode) {
 const (
 	nodeW   = 200
 	nodeH   = 100
-	xScale  = 300 // horizontal gap
+	xScale  = 250 // horizontal gap
 	yScale  = 180 // vertical gap
 	edgePad = 15
 )
@@ -1119,7 +1119,7 @@ func BuildCanvasAncSp(doc *ged.Document, rootID string) *canvas.Canvas {
 
 		// Find the rightmost X in this tree (including spouses)
 		maxX := findMaxXWithSpouses(tree)
-		xOffset = maxX + 3 // 3-unit gap between trees (was 2, +1 for spacing)
+		xOffset = maxX + 2 // gap between trees
 	}
 
 	// 5. Find maxGen for Y flip (oldest at top)
