@@ -126,6 +126,7 @@ type TNode struct {
 	Generation int
 
 	SpouseKey string
+	Spouse    *TNode // actual spouse node (used in descsp mode)
 	Children  []*TNode
 
 	// layout
@@ -275,6 +276,297 @@ func sortChildrenByBirth(n *TNode) {
 	for _, c := range n.Children {
 		sortChildrenByBirth(c)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// descendant tree with spouse nodes (parent → children, spouses as nodes)
+// ---------------------------------------------------------------------------
+func buildDescSpouseTree(m *Model, root string) *TNode {
+	rootInd, ok := m.Indi[root]
+	if !ok || rootInd == nil {
+		log.Fatalf("root individual %q not found in GEDCOM", root)
+	}
+
+	t := &TNode{
+		Key:        root,
+		Name:       rootInd.Name,
+		Birth:      rootInd.Birth,
+		Generation: 1,
+	}
+	stack := []*TNode{t}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		ind := m.Indi[cur.Key]
+		if ind == nil || len(ind.SpouseFams) == 0 {
+			continue
+		}
+
+		for i, famPtr := range ind.SpouseFams {
+			fam := m.Fam[famPtr]
+			if fam == nil {
+				continue
+			}
+
+			// Determine spouse key
+			spKey := ""
+			if fam.Father == cur.Key && fam.Mother != "" {
+				spKey = fam.Mother
+			} else if fam.Mother == cur.Key && fam.Father != "" {
+				spKey = fam.Father
+			}
+
+			// Create spouse node for first marriage
+			if i == 0 && spKey != "" {
+				spInd := m.Indi[spKey]
+				if spInd != nil {
+					cur.Spouse = &TNode{
+						Key:        spKey,
+						Name:       spInd.Name,
+						Birth:      spInd.Birth,
+						Generation: cur.Generation,
+					}
+				}
+			}
+
+			// Add children from this family
+			for _, c := range fam.Children {
+				chInd := m.Indi[normalizePtr(c)]
+				if chInd == nil {
+					continue
+				}
+				child := &TNode{
+					Key:        c,
+					Name:       chInd.Name,
+					Birth:      chInd.Birth,
+					Generation: cur.Generation + 1,
+				}
+				cur.Children = append(cur.Children, child)
+				stack = append(stack, child)
+			}
+		}
+	}
+	sortChildrenByBirth(t)
+	return t
+}
+
+// ---------------------------------------------------------------------------
+// Layout that accounts for spouse nodes sitting beside their partner.
+// Leaves with a spouse consume 2 X slots; without, 1 slot.
+// Interior nodes (with or without spouse) are centred above children.
+// ---------------------------------------------------------------------------
+
+func layoutWithSpouses(root *TNode) {
+	var nextX float64
+	assignXWithSpouses(root, &nextX)
+
+	min := findMinX(root, 0)
+	// also check spouse X values
+	var checkSpouseMin func(n *TNode)
+	checkSpouseMin = func(n *TNode) {
+		if n.Spouse != nil && n.Spouse.X < min {
+			min = n.Spouse.X
+		}
+		for _, c := range n.Children {
+			checkSpouseMin(c)
+		}
+	}
+	checkSpouseMin(root)
+
+	if min < 0 {
+		shiftWithSpouses(root, -min)
+	}
+
+	setY(root)
+	// set spouse Y values
+	var setSpouseY func(n *TNode)
+	setSpouseY = func(n *TNode) {
+		if n.Spouse != nil {
+			n.Spouse.Y = n.Y
+		}
+		for _, c := range n.Children {
+			setSpouseY(c)
+		}
+	}
+	setSpouseY(root)
+}
+
+// coupleWidth returns how many X slots a node (with optional spouse) occupies.
+// Person + connector + spouse = 3 slots when spouse present.
+func coupleWidth(n *TNode) float64 {
+	if n.Spouse != nil {
+		return 3
+	}
+	return 1
+}
+
+// subtreeRight returns the rightmost X used by a node (including its spouse).
+func subtreeRight(n *TNode) float64 {
+	if n.Spouse != nil {
+		return n.Spouse.X
+	}
+	return n.X
+}
+
+func assignXWithSpouses(n *TNode, next *float64) {
+	if len(n.Children) == 0 {
+		// Leaf node
+		n.X = *next
+		if n.Spouse != nil {
+			n.Spouse.X = *next + 2
+			*next += 3
+		} else {
+			*next += 1
+		}
+		return
+	}
+
+	// Interior node: layout children first
+	for _, c := range n.Children {
+		assignXWithSpouses(c, next)
+	}
+
+	// Find the full span of children (including rightmost child's spouse)
+	childLeft := n.Children[0].X
+	childRight := subtreeRight(n.Children[len(n.Children)-1])
+	center := (childLeft + childRight) / 2
+
+	if n.Spouse != nil {
+		// Couple needs 3 slots: person at center-1, gap, spouse at center+1
+		// Ensure the children span is at least 2 wide so the couple fits
+		if childRight-childLeft < 2 {
+			pad := 2 - (childRight - childLeft)
+			center += pad / 2
+			*next += pad // reserve the extra space so siblings don't overlap
+		}
+		n.X = center - 1
+		n.Spouse.X = center + 1
+	} else {
+		n.X = center
+	}
+}
+
+func shiftWithSpouses(n *TNode, dx float64) {
+	n.X += dx
+	if n.Spouse != nil {
+		n.Spouse.X += dx
+	}
+	for _, c := range n.Children {
+		shiftWithSpouses(c, dx)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Canvas builder for descsp mode
+// ---------------------------------------------------------------------------
+
+const connectorSize = 10 // tiny square between spouses
+
+func BuildCanvasDescSp(doc *ged.Document, root string) *canvas.Canvas {
+	model := buildModel(doc)
+	tree := buildDescSpouseTree(model, root)
+	layoutWithSpouses(tree)
+
+	var cvs canvas.Canvas
+
+	// Helper to emit a person node
+	emitPerson := func(n *TNode) {
+		parts := strings.Split(n.Name, "/")
+		var given, surname string
+		if len(parts) > 0 {
+			given = strings.TrimSpace(parts[0])
+		}
+		if len(parts) > 1 {
+			surname = strings.TrimSpace(parts[1])
+		}
+		if given == "" && surname == "" {
+			given = strings.TrimSpace(n.Name)
+		}
+		text := fmt.Sprintf("%s\n%s", given, surname)
+		cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+			ID:     n.Key,
+			Type:   "text",
+			X:      int(n.X * xScale),
+			Y:      int(n.Y * yScale),
+			Width:  nodeW,
+			Height: nodeH,
+			Text:   &text,
+		})
+	}
+
+	// Walk tree, emit nodes + edges
+	var walk func(n *TNode)
+	walk = func(n *TNode) {
+		emitPerson(n)
+
+		if n.Spouse != nil {
+			emitPerson(n.Spouse)
+
+			// Connector node: small blank node centred between the couple
+			connID := n.Key + "_conn"
+			connX := int(((n.X + n.Spouse.X) / 2) * xScale) + nodeW/2 - connectorSize/2
+			connY := int(n.Y*yScale) + nodeH/2 - connectorSize/2
+			blank := ""
+			cvs.Nodes = append(cvs.Nodes, &canvas.Node{
+				ID:     connID,
+				Type:   "text",
+				X:      connX,
+				Y:      connY,
+				Width:  connectorSize,
+				Height: connectorSize,
+				Text:   &blank,
+			})
+
+			// Spouse edges: connector → person, connector → spouse
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       connID + "_to_" + n.Key,
+				FromNode: connID,
+				ToNode:   n.Key,
+				FromSide: strptr("left"),
+				ToSide:   strptr("right"),
+				FromEnd:  strptr("none"),
+				ToEnd:    strptr("arrow"),
+			})
+			cvs.Edges = append(cvs.Edges, &canvas.Edge{
+				ID:       connID + "_to_" + n.Spouse.Key,
+				FromNode: connID,
+				ToNode:   n.Spouse.Key,
+				FromSide: strptr("right"),
+				ToSide:   strptr("left"),
+				FromEnd:  strptr("none"),
+				ToEnd:    strptr("arrow"),
+			})
+
+			// Child edges from connector
+			for _, ch := range n.Children {
+				cvs.Edges = append(cvs.Edges, &canvas.Edge{
+					ID:       connID + "_ch_" + ch.Key,
+					FromNode: connID,
+					ToNode:   ch.Key,
+					FromSide: strptr("bottom"),
+					ToSide:   strptr("top"),
+				})
+			}
+		} else {
+			// No spouse: child edges directly from person
+			for _, ch := range n.Children {
+				cvs.Edges = append(cvs.Edges, &canvas.Edge{
+					ID:       n.Key + "_ch_" + ch.Key,
+					FromNode: n.Key,
+					ToNode:   ch.Key,
+					FromSide: strptr("bottom"),
+					ToSide:   strptr("top"),
+				})
+			}
+		}
+
+		for _, ch := range n.Children {
+			walk(ch)
+		}
+	}
+	walk(tree)
+
+	return &cvs
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +813,7 @@ func main() {
 	// Command-line flags
 	gedPath := flag.String("ged", "", "Path to the GEDCOM file")
 	rootPtr := flag.String("root", "", "Pointer of the root individual (e.g. @I1@)")
-	mode := flag.String("mode", "desc", "Tree mode: currently only 'desc' (descendants) and 'anc' (ancestors) are supported")
+	mode := flag.String("mode", "desc", "Tree mode: 'desc' (descendants), 'anc' (ancestors), 'descsp' (descendants with spouses)")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 
 	flag.Parse()
@@ -533,8 +825,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mode != "desc" && *mode != "anc" {
-		log.Fatalf("unsupported mode %q (only 'desc' and 'anc' are implemented)", *mode)
+	if *mode != "desc" && *mode != "anc" && *mode != "descsp" {
+		log.Fatalf("unsupported mode %q (supported: 'desc', 'anc', 'descsp')", *mode)
 	}
 
 	raw, err := os.ReadFile(*gedPath)
@@ -557,8 +849,10 @@ func main() {
 		cvs = BuildCanvas(doc, resolvedPtr)
 	case "anc":
 		cvs = BuildCanvasAnc(doc, resolvedPtr)
+	case "descsp":
+		cvs = BuildCanvasDescSp(doc, resolvedPtr)
 	default:
-		log.Fatalf("unsupported mode %q (only 'desc' and 'anc' are implemented)", *mode)
+		log.Fatalf("unsupported mode %q (supported: 'desc', 'anc', 'descsp')", *mode)
 	}
 
 	data, _ := json.MarshalIndent(cvs, "", "  ")
