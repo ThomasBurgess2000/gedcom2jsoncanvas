@@ -562,8 +562,7 @@ func main() {
 	}
 
 	data, _ := json.MarshalIndent(cvs, "", "  ")
-	out := "C:\\Users\\thoma\\Desktop\\Family Tree\\familytree.canvas"
-	// out := strings.TrimSuffix(*gedPath, ".ged") + ".canvas"
+	out := strings.TrimSuffix(*gedPath, ".ged") + ".canvas"
 	_ = os.WriteFile(out, data, 0644)
 	fmt.Println("wrote", out)
 }
