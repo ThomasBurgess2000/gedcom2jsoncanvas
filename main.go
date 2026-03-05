@@ -1088,38 +1088,166 @@ func BuildCanvasAncSp(doc *ged.Document, rootID string) *canvas.Canvas {
 		}
 	}
 
-	// 3. Build descendant trees from each lineage root
+	// 3. Build descendant trees from each lineage root, tracking cross-edges per tree
 	seen := make(map[string]bool)
-	var crossEdges []CrossEdge
+	var allCrossEdges []CrossEdge
 	var trees []*TNode
+	treeCrossEdges := make(map[int][]CrossEdge) // tree index → its cross-edges
 
 	for _, lr := range lineageRoots {
 		if seen[lr.ID] {
 			continue // already placed as a spouse in a previous tree
 		}
-		tree := buildLineageDescTree(model, lr.ID, lr.Generation, seen, &crossEdges)
+		var treeEdges []CrossEdge
+		tree := buildLineageDescTree(model, lr.ID, lr.Generation, seen, &treeEdges)
 		if tree != nil {
+			idx := len(trees)
 			trees = append(trees, tree)
+			treeCrossEdges[idx] = treeEdges
+			allCrossEdges = append(allCrossEdges, treeEdges...)
 		}
 	}
 
 	if debug {
-		log.Printf("Built %d trees, %d cross-edges", len(trees), len(crossEdges))
+		log.Printf("Built %d trees, %d cross-edges", len(trees), len(allCrossEdges))
 	}
 
-	// 4. Layout each tree independently, then place side by side
-	var xOffset float64
+	// 4. Layout each tree internally, then position to align with cross-edge targets
+	// First pass: layout each tree starting at X=0
 	for _, tree := range trees {
 		layoutWithSpouses(tree)
+	}
 
-		// Shift tree to the right of previous trees
-		if xOffset > 0 {
-			shiftWithSpouses(tree, xOffset)
+	// Build a lookup from node key to its absolute X position (populated as trees are placed)
+	placedNodeX := make(map[string]float64)
+
+	// collectNodeKeys returns all node keys in a tree (including spouses)
+	var collectKeys func(n *TNode, keys map[string]*TNode)
+	collectKeys = func(n *TNode, keys map[string]*TNode) {
+		keys[n.Key] = n
+		if n.Spouse != nil {
+			keys[n.Spouse.Key] = n.Spouse
+		}
+		for _, c := range n.Children {
+			collectKeys(c, keys)
+		}
+	}
+
+	// collectGenBounds returns the rightmost X used at each generation in a tree
+	type genBound struct {
+		gen        int
+		leftmost   float64
+		rightmost  float64
+	}
+	var collectGenBounds func(n *TNode, bounds map[int]*genBound)
+	collectGenBounds = func(n *TNode, bounds map[int]*genBound) {
+		b, ok := bounds[n.Generation]
+		if !ok {
+			b = &genBound{gen: n.Generation, leftmost: n.X, rightmost: n.X}
+			bounds[n.Generation] = b
+		}
+		if n.X < b.leftmost {
+			b.leftmost = n.X
+		}
+		if n.X > b.rightmost {
+			b.rightmost = n.X
+		}
+		if n.Spouse != nil {
+			if n.Spouse.X < b.leftmost {
+				b.leftmost = n.Spouse.X
+			}
+			if n.Spouse.X > b.rightmost {
+				b.rightmost = n.Spouse.X
+			}
+		}
+		for _, c := range n.Children {
+			collectGenBounds(c, bounds)
+		}
+	}
+
+	// Track rightmost X used at each generation across all placed trees
+	genRightEdge := make(map[int]float64) // generation → rightmost X
+
+	for i, tree := range trees {
+		// Determine ideal offset from cross-edge alignment
+		edges := treeCrossEdges[i]
+		idealOffset := 0.0
+		hasIdeal := false
+
+		if len(edges) > 0 {
+			treeNodes := make(map[string]*TNode)
+			collectKeys(tree, treeNodes)
+
+			var totalShift float64
+			var count int
+			for _, ce := range edges {
+				targetX, ok := placedNodeX[ce.ToChildKey]
+				if !ok {
+					continue
+				}
+				personKey := strings.TrimSuffix(ce.FromConnKey, "_conn")
+				srcNode, ok := treeNodes[personKey]
+				if !ok {
+					continue
+				}
+				sourceX := srcNode.X
+				if srcNode.Spouse != nil {
+					sourceX = (srcNode.X + srcNode.Spouse.X) / 2
+				}
+				totalShift += targetX - sourceX
+				count++
+			}
+			if count > 0 {
+				idealOffset = totalShift / float64(count)
+				hasIdeal = true
+			}
 		}
 
-		// Find the rightmost X in this tree (including spouses)
-		maxX := findMaxXWithSpouses(tree)
-		xOffset = maxX + 2 // gap between trees
+		// Find minimum offset that avoids overlap at every generation this tree uses
+		treeBounds := make(map[int]*genBound)
+		collectGenBounds(tree, treeBounds)
+
+		minAllowed := 0.0
+		if i > 0 {
+			minAllowed = -1e9 // start very negative, find the tightest constraint
+			for gen, tb := range treeBounds {
+				rightUsed, exists := genRightEdge[gen]
+				if !exists {
+					continue
+				}
+				// At this generation, we need: tree's leftmost + offset > rightUsed + gap
+				needed := rightUsed + 2 - tb.leftmost
+				if needed > minAllowed {
+					minAllowed = needed
+				}
+			}
+			if minAllowed < -1e8 {
+				// No overlapping generations found — can place at ideal or 0
+				minAllowed = 0
+			}
+		}
+
+		offset := idealOffset
+		if !hasIdeal || offset < minAllowed {
+			offset = minAllowed
+		}
+
+		shiftWithSpouses(tree, offset)
+
+		// Register placed node positions and update per-generation right edges
+		treeNodes := make(map[string]*TNode)
+		collectKeys(tree, treeNodes)
+		for key, node := range treeNodes {
+			placedNodeX[key] = node.X
+		}
+
+		for gen, tb := range treeBounds {
+			// tb bounds are pre-shift; add offset
+			newRight := tb.rightmost + offset
+			if existing, ok := genRightEdge[gen]; !ok || newRight > existing {
+				genRightEdge[gen] = newRight
+			}
+		}
 	}
 
 	// 5. Find maxGen for Y flip (oldest at top)
@@ -1265,7 +1393,7 @@ func BuildCanvasAncSp(doc *ged.Document, rootID string) *canvas.Canvas {
 	}
 
 	// 7. Emit cross-edges
-	for i, ce := range crossEdges {
+	for i, ce := range allCrossEdges {
 		edgeID := fmt.Sprintf("cross_%d_%s_%s", i, ce.FromConnKey, ce.ToChildKey)
 		cvs.Edges = append(cvs.Edges, &canvas.Edge{
 			ID:       edgeID,
@@ -1293,6 +1421,22 @@ func findMaxXWithSpouses(n *TNode) float64 {
 		}
 	}
 	return maxX
+}
+
+// findMinXWithSpouses returns the leftmost X value in a tree, including
+// spouse nodes.
+func findMinXWithSpouses(n *TNode) float64 {
+	minX := n.X
+	if n.Spouse != nil && n.Spouse.X < minX {
+		minX = n.Spouse.X
+	}
+	for _, c := range n.Children {
+		cx := findMinXWithSpouses(c)
+		if cx < minX {
+			minX = cx
+		}
+	}
+	return minX
 }
 
 // ----------------------------------------------------------------------------
